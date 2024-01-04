@@ -26,6 +26,23 @@ typedef struct {
     size_t len;
 } response_t;
 
+typedef struct {
+    double lat;
+    double lon;
+    const char* city_name;
+} geodata_t;
+
+typedef struct {
+    double co;
+    double no;
+    double no3;
+    double o3;
+    double so2;
+    double nh3;
+    double pm2_5;
+    double pm10;
+} pollutants_t;
+
 
 static char* COLORS_TABLE[5] = {
     ANSI_COLOR_CYAN,
@@ -102,6 +119,56 @@ make_request(CURL* curl, CURLU* url, char* api_key) {
         return NULL;
 }
 
+static geodata_t*
+fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
+    json_error_t error;
+    geodata_t* geodata = NULL;
+    json_t* coords_root = NULL;
+    response_t* geocoding_response  = NULL;
+
+    uint16_t city_name_param_size = strlen(city_name) + 3;
+    char* city_name_param = malloc(city_name_param_size);
+    snprintf(city_name_param, city_name_param_size, "q=%s", city_name);
+
+    CURLU* geocoding_url = curl_url();
+    curl_url_set(geocoding_url, CURLUPART_URL, GEOCODING_URL, 0);
+    curl_url_set(geocoding_url, CURLUPART_QUERY, city_name_param, 0);
+    curl_url_set(geocoding_url, CURLUPART_QUERY, "limit=1", CURLU_APPENDQUERY);
+
+    geocoding_response = make_request(curl, geocoding_url, api_key);
+    if (geocoding_response == NULL) goto fail;
+
+    coords_root = json_loads(geocoding_response->data, 0, &error);
+    if (coords_root == NULL) goto fail;
+
+    json_t* target = json_array_get(coords_root, 0);
+    if (target == NULL) goto fail;
+
+    geodata = malloc(sizeof(geodata_t));
+    const char* name = json_string_value(json_object_get(target, "name"));
+
+    geodata->city_name = malloc(sizeof(char) * strlen(name));
+    memcpy((void*)geodata->city_name, name, sizeof(char) * strlen(name));
+
+    geodata->lat = json_real_value(json_object_get(target, "lat"));
+    geodata->lon = json_real_value(json_object_get(target, "lon"));
+
+    if (geodata->lat == 0 || geodata->lon == 0) goto fail;
+
+    free(geocoding_response);
+    free(city_name_param);
+    json_decref(coords_root);
+
+    return geodata;
+
+    fail:
+        free(geodata);
+        free(city_name_param);
+        free(geocoding_response);
+        json_decref(coords_root);
+        return NULL;
+}
+
 static inline void
 print_color_tag(char* color) {
     printf("%s", color);
@@ -140,18 +207,11 @@ main(int argc, char const **argv, char const **env) {
     char* failure_reason = NULL;
     json_error_t error;
 
-    char* city_name_param = NULL;
-
     char* lat_param = NULL;
     char* lon_param = NULL;
 
-    CURLU* geocoding_url = curl_url();
     CURLU* pollution_url = curl_url();
-
-    response_t* geocoding_response = NULL;
     response_t* pollution_response = NULL;
-
-    json_t* coords_root = NULL;
     json_t* report_root = NULL;
 
     CURL* curl = curl_easy_init();
@@ -169,35 +229,18 @@ main(int argc, char const **argv, char const **env) {
     char* api_key = getenv("API_KEY"); 
     const char* city_name = argv[1];
 
-    uint16_t city_name_param_size = strlen(city_name) + 3;
-    city_name_param = malloc(city_name_param_size);
-    snprintf(city_name_param, city_name_param_size, "q=%s", city_name);
-
-    curl_url_set(geocoding_url, CURLUPART_URL, GEOCODING_URL, 0);
-    curl_url_set(geocoding_url, CURLUPART_QUERY, city_name_param, 0);
-    curl_url_set(geocoding_url, CURLUPART_QUERY, "limit=1", CURLU_APPENDQUERY);
-
-    geocoding_response = make_request(curl, geocoding_url, api_key);
-    if (geocoding_response == NULL) goto no_geo_data;
-
-    coords_root = json_loads(geocoding_response->data, 0, &error);
-    if (coords_root == NULL) goto no_geo_data;
-
-    json_t* target = json_array_get(coords_root, 0);
-    if (target == NULL) goto no_geo_data;
-
-    const char* returned_city_name = json_string_value(json_object_get(target, "name"));
-
-    double lat = json_real_value(json_object_get(target, "lat"));
-    double lon = json_real_value(json_object_get(target, "lon"));
-    if (lat == 0 || lon == 0) goto no_geo_data;
+    geodata_t* geodata = fetch_geodata(curl, city_name, api_key);
+    if (geodata == NULL) {
+        failure_reason = "Cannot fetch geodata, please try again.";
+        goto exit;
+    }
 
     uint16_t param_size = sizeof(char) * 12 + 1;
     lat_param = malloc(param_size);
     lon_param = malloc(param_size);
 
-    snprintf(lat_param, param_size, "lat=%.2f", lat);
-    snprintf(lon_param, param_size, "lon=%.2f", lon);
+    snprintf(lat_param, param_size, "lat=%.2f", geodata->lat);
+    snprintf(lon_param, param_size, "lon=%.2f", geodata->lon);
 
     curl_url_set(pollution_url, CURLUPART_URL, POLLUTION_URL, 0);
     curl_url_set(pollution_url, CURLUPART_QUERY, lat_param, 0);
@@ -209,7 +252,6 @@ main(int argc, char const **argv, char const **env) {
     report_root = json_loads(pollution_response->data, 0, &error);
     if (report_root == NULL) goto no_pollution_data;
 
-    // Use json_unpack
     json_t* list = json_object_get(report_root, "list");
     json_t* obj = json_array_get(list, 0);
     json_t* main = json_object_get(obj, "main");
@@ -223,7 +265,7 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
-    printf("\nAir quality in %s ", returned_city_name);
+    printf("\nAir quality in %s ", geodata->city_name);
     print_color_tag(COLORS_TABLE[aqi_value - 1]);
     printf("\n\nAQI %hhu (%s) \n\n", aqi_value, LABELS_TABLE[aqi_value - 1]);
 
@@ -239,10 +281,6 @@ main(int argc, char const **argv, char const **env) {
     print_legend();
 
     goto exit;
-
-    no_geo_data:
-        failure_reason = "Cannot fetch geodata, please try again.";
-        goto exit;
 
     no_pollution_data:
         failure_reason = "Cannot fetch pollution data, please try again.";
