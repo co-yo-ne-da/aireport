@@ -3,11 +3,15 @@
 #include <inttypes.h>
 #include <string.h>
 
+#include<unistd.h>
+#include <pthread.h>
+
 #include <wchar.h>
 #include <locale.h>
 
 #include <curl/curl.h>
 #include <jansson.h>
+
 
 #define ANSI_COLOR_RED     "\x1b[31m"
 #define ANSI_COLOR_GREEN   "\x1b[32m"
@@ -19,6 +23,9 @@
 
 #define ERASE_CURRENT_LINE "[2K\r"
 #define ERASE_LINE_ABOVE "\33[2K\r"
+
+#define HIDE_CURSOR "\33[?25l"
+#define ENABLE_CURSOR "\33[?25h"
 
 #define BUFFER_SIZE (512 * 1024)
 #define GEOCODING_URL "http://api.openweathermap.org/geo/1.0/direct"
@@ -112,7 +119,7 @@ make_request(CURL* curl, CURLU* url, char* api_key) {
         free(response);
         fprintf(
             stderr,
-            "The resource responded with status code %s %d %s \n",
+            "The remote host responded with the error status code %s (%d) %s \n",
             ANSI_COLOR_YELLOW, res_code, ANSI_COLOR_RESET
         );
         return NULL;
@@ -139,6 +146,7 @@ fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
     curl_url_set(geocoding_url, CURLUPART_QUERY, "limit=1", CURLU_APPENDQUERY);
 
     geocoding_response = make_request(curl, geocoding_url, api_key);
+
     if (geocoding_response == NULL) goto fail;
 
     coords_root = json_loads(geocoding_response->data, 0, &error);
@@ -161,16 +169,15 @@ fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
     if (geodata->lat == 0 || geodata->lon == 0) goto fail;
 
     free(geocoding_response);
-    free(city_name_param);
     json_decref(coords_root);
 
     return geodata;
 
     fail:
-        free(geodata);
-        free(city_name_param);
-        free(geocoding_response);
-        json_decref(coords_root);
+        if (geodata) free(geodata);
+        if (city_name_param) free(city_name_param);
+        if (geocoding_response) free(geocoding_response);
+        if (coords_root) json_decref(coords_root);
         return NULL;
 }
 
@@ -207,9 +214,43 @@ print_legend() {
     printf("\n\n");
 }
 
+
+static inline void
+print_loader_fragment(size_t code, char* label, struct timespec* ts) {
+    wprintf(L"%s[%lc]%s", ANSI_COLOR_MAGENTA, code, ANSI_COLOR_RESET);
+    fflush(stdout);
+    nanosleep(ts, NULL);
+    printf("\r%s ", label);
+    fflush(stdout);
+}
+
+
+static void*
+show_loader(void* label) {
+    uint32_t ms = 150;
+
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    
+    printf(HIDE_CURSOR);
+    printf("\n\r%s ", (char*)label);
+    fflush(stdout);
+    
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+    while (1) {
+        print_loader_fragment(0x25E2, (char*)label, &ts);
+        print_loader_fragment(0x25E3, (char*)label, &ts);
+        print_loader_fragment(0x25E4, (char*)label, &ts);
+        print_loader_fragment(0x25E5, (char*)label, &ts);
+    }
+
+    printf(ENABLE_CURSOR);
+    fflush(stdout);
+}
+
 int
 main(int argc, char const **argv, char const **env) {
-    setlocale(LC_CTYPE, "");
     char* failure_reason = NULL;
     json_error_t error;
 
@@ -220,8 +261,12 @@ main(int argc, char const **argv, char const **env) {
     response_t* pollution_response = NULL;
     json_t* report_root = NULL;
 
+    pthread_t* loader_thread_id = NULL;
+
     CURL* curl = curl_easy_init();
     curl_global_init(CURL_GLOBAL_ALL);
+
+    setlocale(LC_CTYPE, "");
 
     if (curl == NULL) {
         failure_reason = "Failed to initialize curl.";
@@ -243,7 +288,9 @@ main(int argc, char const **argv, char const **env) {
     // TODO: Do it safely with a buffer
     const char* city_name = argv[1];
 
-    // TODO: Implement loader
+    // Loader
+    loader_thread_id = malloc(sizeof(pthread_t));
+    pthread_create(loader_thread_id, NULL, &show_loader, "Loading data");
 
     geodata_t* geodata = fetch_geodata(curl, city_name, api_key);
     if (geodata == NULL) {
@@ -281,9 +328,14 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
-    printf("\nAir quality in %s ", geodata->city_name);
+    pthread_cancel(*loader_thread_id);
+    printf(ERASE_LINE_ABOVE);
+    printf(ENABLE_CURSOR);
+    fflush(stdout);
+
+    printf("Air quality in %s ", geodata->city_name);
     print_color_tag(COLORS_TABLE[aqi_value - 1]);
-    printf("\n\nAQI %hhu (%s) \n\n", aqi_value, LABELS_TABLE[aqi_value - 1]);
+    printf("\n\n\tAQI %hhu (%s) \n\n", aqi_value, LABELS_TABLE[aqi_value - 1]);
 
     print_pollutant_row("Carbone monoxide (CO)  ",  json_object_get(components, "co"),     0);
     print_pollutant_row("Nitrogen monoxide (NO) ",  json_object_get(components, "no"),     1);
@@ -303,7 +355,19 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
 
     exit:
+        // TODO: Handle signals gracefully
+        printf(ENABLE_CURSOR);
         fflush(stdout);
+
+        if (loader_thread_id != NULL) {
+            void* state;
+            pthread_join(*loader_thread_id, &state);
+            if (state != PTHREAD_CANCELED) {
+                pthread_cancel(*loader_thread_id);
+                printf(ERASE_LINE_ABOVE);
+                fflush(stdout);
+            }
+        }
 
         curl_easy_cleanup(curl);
         curl_global_cleanup();
@@ -313,5 +377,5 @@ main(int argc, char const **argv, char const **env) {
             exit(1);
         }
 
-        return 0;
+        exit(0);
 }

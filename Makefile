@@ -1,7 +1,6 @@
 CC=clang
 
-LIBCURL = -lcurl
-LIBJANSSON = -ljansson
+LINKS = -lcurl -ljansson -lpthread
 
 CFLAGS = -Wall -Ofast --std=c99
 
@@ -17,7 +16,7 @@ BIN = $(BIN_DIR)/aireport
 all: $(BIN)
 
 $(BIN): $(OBJECTS)
-	$(CC) $(OBJECTS) -o $@ ${LIBCURL} ${LIBJANSSON}
+	$(CC) $(OBJECTS) -o $@ ${LINKS}
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) -c $< -o $@ $(CFLAGS)
