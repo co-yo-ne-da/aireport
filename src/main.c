@@ -17,6 +17,9 @@
 #define ANSI_COLOR_CYAN    "\x1b[36m"
 #define ANSI_COLOR_RESET   "\x1b[0m"
 
+#define ERASE_CURRENT_LINE "[2K\r"
+#define ERASE_LINE_ABOVE "\33[2K\r"
+
 #define BUFFER_SIZE (512 * 1024)
 #define GEOCODING_URL "http://api.openweathermap.org/geo/1.0/direct"
 #define POLLUTION_URL "http://api.openweathermap.org/data/2.5/air_pollution"
@@ -84,7 +87,6 @@ write_response(void *ptr, size_t size, size_t nmemb, void *stream) {
 
 static response_t*
 make_request(CURL* curl, CURLU* url, char* api_key) {
-    CURLcode curl_code;
     uint32_t res_code;
 
     response_t* response = malloc(sizeof(response_t));
@@ -97,27 +99,28 @@ make_request(CURL* curl, CURLU* url, char* api_key) {
     curl_url_set(url, CURLUPART_QUERY, api_key_param, CURLU_APPENDQUERY);
 
     curl_easy_setopt(curl, CURLOPT_CURLU, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &write_response);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
 
     free(api_key_param);
 
-    curl_code = curl_easy_perform(curl);
-/*    if (curl_code != CURLE_OK) {
-        fprintf(stderr, "%s \n", curl_easy_strerror(curl_code));
-        goto fail;
-    };*/
-
+    curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &res_code);
     curl_easy_reset(curl);
 
-    if (res_code != 200) goto fail;
-    return response;
-
-    fail:
+    if (res_code != 200) {
         free(response);
+        fprintf(
+            stderr,
+            "The resource responded with status code %s %d %s \n",
+            ANSI_COLOR_YELLOW, res_code, ANSI_COLOR_RESET
+        );
         return NULL;
+    }
+
+    return response;
 }
+
 
 static geodata_t*
 fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
@@ -145,10 +148,12 @@ fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
     if (target == NULL) goto fail;
 
     geodata = malloc(sizeof(geodata_t));
-    const char* name = json_string_value(json_object_get(target, "name"));
 
-    geodata->city_name = malloc(sizeof(char) * strlen(name));
-    memcpy((void*)geodata->city_name, name, sizeof(char) * strlen(name));
+    const char* name = json_string_value(json_object_get(target, "name"));
+    size_t name_size = sizeof(char) * strlen(name);
+    geodata->city_name = malloc(name_size);
+
+    memcpy((void*)geodata->city_name, name, name_size);
 
     geodata->lat = json_real_value(json_object_get(target, "lat"));
     geodata->lon = json_real_value(json_object_get(target, "lon"));
@@ -168,6 +173,7 @@ fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
         json_decref(coords_root);
         return NULL;
 }
+
 
 static inline void
 print_color_tag(char* color) {
@@ -193,7 +199,7 @@ print_pollutant_row(char* label, json_t* pollutant_volume, uint8_t ranges_table_
 
 static inline void
 print_legend() {
-    printf("\n\n");
+    printf("\n\n\t");
     for (uint8_t i = 0; i < 5; i++) {
         print_color_tag(COLORS_TABLE[i]);
         printf(" %s  ", LABELS_TABLE[i]);   
@@ -215,6 +221,7 @@ main(int argc, char const **argv, char const **env) {
     json_t* report_root = NULL;
 
     CURL* curl = curl_easy_init();
+    curl_global_init(CURL_GLOBAL_ALL);
 
     if (curl == NULL) {
         failure_reason = "Failed to initialize curl.";
@@ -226,8 +233,17 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
+    // TODO Do it safely with a buffer
     char* api_key = getenv("API_KEY"); 
+    if (api_key == NULL) {
+        failure_reason = "Please provide API_KEY";
+        goto exit;
+    }
+
+    // TODO: Do it safely with a buffer
     const char* city_name = argv[1];
+
+    // TODO: Implement loader
 
     geodata_t* geodata = fetch_geodata(curl, city_name, api_key);
     if (geodata == NULL) {
@@ -253,9 +269,9 @@ main(int argc, char const **argv, char const **env) {
     if (report_root == NULL) goto no_pollution_data;
 
     json_t* list = json_object_get(report_root, "list");
-    json_t* obj = json_array_get(list, 0);
+    json_t* obj  = json_array_get(list, 0);
     json_t* main = json_object_get(obj, "main");
-    json_t* aqi = json_object_get(main, "aqi");
+    json_t* aqi  = json_object_get(main, "aqi");
 
     json_t* components = json_object_get(obj, "components");
 

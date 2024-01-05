@@ -3,7 +3,7 @@ CC=clang
 LIBCURL = -lcurl
 LIBJANSSON = -ljansson
 
-CFLAGS = -Wall -O3 --std=c99
+CFLAGS = -Wall -Ofast --std=c99
 
 SRC_DIR=src
 OBJ_DIR=obj
