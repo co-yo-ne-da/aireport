@@ -3,7 +3,7 @@
 #include <inttypes.h>
 #include <string.h>
 
-#include<unistd.h>
+#include <unistd.h>
 #include <pthread.h>
 
 #include <wchar.h>
@@ -98,7 +98,7 @@ write_response(void *ptr, size_t size, size_t nmemb, void *stream) {
 }
 
 
-static inline char*
+static char*
 make_query_param(char* key, void* value, uint8_t value_type) {
     size_t param_size;
     char* param_ptr = NULL;
@@ -106,7 +106,7 @@ make_query_param(char* key, void* value, uint8_t value_type) {
     switch (value_type) {
         case QUERY_PARAM_STRING:
             // Lengths + "=" + "\0"
-            param_size = strlen(key) + strlen(value) + 2 * sizeof(char);
+            param_size = strlen(key) + strlen((char*) value) + 2 * sizeof(char);
             param_ptr = malloc(param_size);
             snprintf(param_ptr, param_size, "%s=%s", key, (char*)value);
             break;
@@ -124,14 +124,13 @@ make_query_param(char* key, void* value, uint8_t value_type) {
 }
 
 static response_t*
-make_request(CURL* curl, CURLU* url, char* api_key) {
+make_request(CURL* curl, CURLU* url) {
     uint32_t res_code;
 
     response_t* response = malloc(sizeof(response_t));
     response->data = malloc(BUFFER_SIZE);
     response->len = 0;
 
-    curl_url_set(url, CURLUPART_QUERY, make_query_param("appid", api_key, QUERY_PARAM_STRING), CURLU_APPENDQUERY);
     curl_easy_setopt(curl, CURLOPT_CURLU, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &write_response);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
@@ -156,6 +155,7 @@ make_request(CURL* curl, CURLU* url, char* api_key) {
 
 static geodata_t*
 fetch_geodata(CURL* curl, char* city_name, char* api_key) {
+    uint8_t retry_attempts = 3;
     json_error_t error;
     geodata_t* geodata = NULL;
     json_t* coords_root = NULL;
@@ -165,14 +165,27 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
     curl_url_set(geocoding_url, CURLUPART_URL, GEOCODING_URL, 0);
     curl_url_set(geocoding_url, CURLUPART_QUERY, make_query_param("q", city_name, QUERY_PARAM_STRING), 0);
     curl_url_set(geocoding_url, CURLUPART_QUERY, "limit=1", CURLU_APPENDQUERY);
+    curl_url_set(
+        geocoding_url,
+        CURLUPART_QUERY,
+        make_query_param("appid", api_key, QUERY_PARAM_STRING),
+        CURLU_APPENDQUERY
+    );
 
-    geocoding_response = make_request(curl, geocoding_url, api_key);
-    if (geocoding_response == NULL) goto fail;
+    json_t* target = NULL;
+    for (uint8_t i = retry_attempts; i > 0; i--) {
+        geocoding_response = make_request(curl, geocoding_url);
+        if (geocoding_response == NULL) goto fail;
 
-    coords_root = json_loads(geocoding_response->data, 0, &error);
-    if (coords_root == NULL) goto fail;
+        coords_root = json_loads(geocoding_response->data, 0, &error);
+        if (coords_root == NULL) goto fail;
 
-    json_t* target = json_array_get(coords_root, 0);
+        target = json_array_get(coords_root, 0);
+        if (target != NULL) break;
+
+        sleep(1);
+    }
+
     if (target == NULL) goto fail;
 
     geodata = malloc(sizeof(geodata_t));
@@ -272,6 +285,7 @@ show_loader(void* label) {
 
 int
 main(int argc, char const **argv, char const **env) {
+    /* -- Initialisation -- */
     char* failure_reason = NULL;
     json_error_t error;
 
@@ -281,13 +295,23 @@ main(int argc, char const **argv, char const **env) {
 
     pthread_t* loader_thread_id = NULL;
 
+    setlocale(LC_CTYPE, "");
+
+    char* api_key_env = getenv("API_KEY");
+    size_t api_key_len = (strnlen(api_key_env, PARAM_BUFFER_SIZE) + 1) * sizeof(char);
+    char* api_key = malloc(api_key_len);
+    strncpy(api_key, api_key_env, api_key_len);
+
     CURL* curl = curl_easy_init();
     curl_global_init(CURL_GLOBAL_ALL);
 
-    setlocale(LC_CTYPE, "");
-
     if (curl == NULL) {
         failure_reason = "Failed to initialize curl.";
+        goto exit;
+    }
+
+    if (api_key == NULL) {
+        failure_reason = "Please provide API_KEY";
         goto exit;
     }
 
@@ -296,28 +320,23 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
-    // TODO: Do it safely with a buffer
-    char* api_key = getenv("API_KEY");
-    if (api_key == NULL) {
-        failure_reason = "Please provide API_KEY";
-        goto exit;
-    }
-
     // TODO: Abstract param bufferisation
     uint32_t param_size = strnlen(argv[1], PARAM_BUFFER_SIZE);
     char* city_name = malloc(param_size);
     strncpy(city_name, argv[1], param_size);
 
-    // Loader
+    /* -- Starting loader -- */
     loader_thread_id = malloc(sizeof(pthread_t));
     pthread_create(loader_thread_id, NULL, &show_loader, "Loading data");
 
+    /* -- Fetching geodata (correct city name, lat and lon) -- */
     geodata_t* geodata = fetch_geodata(curl, city_name, api_key);
     if (geodata == NULL) {
         failure_reason = "Cannot fetch geodata, please try again.";
         goto exit;
     }
 
+    /* -- Fetching pollution data -- */
     curl_url_set(pollution_url, CURLUPART_URL, POLLUTION_URL, 0);
     curl_url_set(
         pollution_url, 
@@ -332,7 +351,14 @@ main(int argc, char const **argv, char const **env) {
         CURLU_APPENDQUERY
     );
 
-    pollution_response = make_request(curl, pollution_url, api_key);
+    curl_url_set(
+        pollution_url,
+        CURLUPART_QUERY, 
+        make_query_param("appid", api_key, QUERY_PARAM_STRING),
+        CURLU_APPENDQUERY
+    );
+
+    pollution_response = make_request(curl, pollution_url);
     if (pollution_response == NULL) goto no_pollution_data;
 
     report_root = json_loads(pollution_response->data, 0, &error);
@@ -351,11 +377,13 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
+    /* -- Removing loader -- */
     pthread_cancel(*loader_thread_id);
     printf(ERASE_LINE_ABOVE);
     printf(ENABLE_CURSOR);
     fflush(stdout);
 
+    /* -- Printing the report -- */
     printf("Air quality in %s ", geodata->city_name);
     print_color_tag(COLORS_TABLE[aqi_value - 1]);
     printf("\n\n\tAQI %hhu (%s) \n\n", aqi_value, LABELS_TABLE[aqi_value - 1]);
@@ -378,6 +406,7 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
 
     exit:
+        free(api_key);
         // TODO: Handle signals gracefully
         printf(ENABLE_CURSOR);
         fflush(stdout);
