@@ -28,8 +28,14 @@
 #define ENABLE_CURSOR "\33[?25h"
 
 #define BUFFER_SIZE (512 * 1024)
+#define PARAM_BUFFER_SIZE 512
+
 #define GEOCODING_URL "http://api.openweathermap.org/geo/1.0/direct"
 #define POLLUTION_URL "http://api.openweathermap.org/data/2.5/air_pollution"
+
+#define QUERY_PARAM_STRING 1 << 1
+#define QUERY_PARAM_DOUBLE 2 << 1
+
 
 typedef struct {
     char* data;
@@ -92,6 +98,31 @@ write_response(void *ptr, size_t size, size_t nmemb, void *stream) {
 }
 
 
+static inline char*
+make_query_param(char* key, void* value, uint8_t value_type) {
+    size_t param_size;
+    char* param_ptr = NULL;
+
+    switch (value_type) {
+        case QUERY_PARAM_STRING:
+            // Lengths + "=" + "\0"
+            param_size = strlen(key) + strlen(value) + 2 * sizeof(char);
+            param_ptr = malloc(param_size);
+            snprintf(param_ptr, param_size, "%s=%s", key, (char*)value);
+            break;
+        case QUERY_PARAM_DOUBLE:
+            // 4 bytes for signed int (0-180) + 2 bytes for the fractional part + "." + "=" + "\0"
+            param_size = strlen(key) + (9 * sizeof(char));
+            param_ptr = malloc(param_size);
+            snprintf(param_ptr, param_size, "%s=%.2f", key, *((double*) value));
+            break;
+        default:
+            fprintf(stderr, "%s Invalid query parameter type. %s\n", ANSI_COLOR_RED, ANSI_COLOR_RESET);
+    }
+
+    return param_ptr;
+}
+
 static response_t*
 make_request(CURL* curl, CURLU* url, char* api_key) {
     uint32_t res_code;
@@ -100,16 +131,10 @@ make_request(CURL* curl, CURLU* url, char* api_key) {
     response->data = malloc(BUFFER_SIZE);
     response->len = 0;
 
-    char* api_key_param = malloc(strlen(api_key) + 8);
-    strcpy(api_key_param, "appid=");
-    strcat(api_key_param, api_key);
-    curl_url_set(url, CURLUPART_QUERY, api_key_param, CURLU_APPENDQUERY);
-
+    curl_url_set(url, CURLUPART_QUERY, make_query_param("appid", api_key, QUERY_PARAM_STRING), CURLU_APPENDQUERY);
     curl_easy_setopt(curl, CURLOPT_CURLU, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &write_response);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
-
-    free(api_key_param);
 
     curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &res_code);
@@ -130,23 +155,18 @@ make_request(CURL* curl, CURLU* url, char* api_key) {
 
 
 static geodata_t*
-fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
+fetch_geodata(CURL* curl, char* city_name, char* api_key) {
     json_error_t error;
     geodata_t* geodata = NULL;
     json_t* coords_root = NULL;
     response_t* geocoding_response  = NULL;
 
-    uint16_t city_name_param_size = strlen(city_name) + 3;
-    char* city_name_param = malloc(city_name_param_size);
-    snprintf(city_name_param, city_name_param_size, "q=%s", city_name);
-
     CURLU* geocoding_url = curl_url();
     curl_url_set(geocoding_url, CURLUPART_URL, GEOCODING_URL, 0);
-    curl_url_set(geocoding_url, CURLUPART_QUERY, city_name_param, 0);
+    curl_url_set(geocoding_url, CURLUPART_QUERY, make_query_param("q", city_name, QUERY_PARAM_STRING), 0);
     curl_url_set(geocoding_url, CURLUPART_QUERY, "limit=1", CURLU_APPENDQUERY);
 
     geocoding_response = make_request(curl, geocoding_url, api_key);
-
     if (geocoding_response == NULL) goto fail;
 
     coords_root = json_loads(geocoding_response->data, 0, &error);
@@ -166,6 +186,7 @@ fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
     geodata->lat = json_real_value(json_object_get(target, "lat"));
     geodata->lon = json_real_value(json_object_get(target, "lon"));
 
+    // Implement retry
     if (geodata->lat == 0 || geodata->lon == 0) goto fail;
 
     free(geocoding_response);
@@ -175,7 +196,6 @@ fetch_geodata(CURL* curl, const char* city_name, char* api_key) {
 
     fail:
         if (geodata) free(geodata);
-        if (city_name_param) free(city_name_param);
         if (geocoding_response) free(geocoding_response);
         if (coords_root) json_decref(coords_root);
         return NULL;
@@ -227,6 +247,8 @@ print_loader_fragment(size_t code, char* label, struct timespec* ts) {
 
 static void*
 show_loader(void* label) {
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+
     uint32_t ms = 150;
 
     struct timespec ts;
@@ -237,7 +259,6 @@ show_loader(void* label) {
     printf("\n\r%s ", (char*)label);
     fflush(stdout);
     
-    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
     while (1) {
         print_loader_fragment(0x25E2, (char*)label, &ts);
         print_loader_fragment(0x25E3, (char*)label, &ts);
@@ -253,9 +274,6 @@ int
 main(int argc, char const **argv, char const **env) {
     char* failure_reason = NULL;
     json_error_t error;
-
-    char* lat_param = NULL;
-    char* lon_param = NULL;
 
     CURLU* pollution_url = curl_url();
     response_t* pollution_response = NULL;
@@ -278,15 +296,17 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
-    // TODO Do it safely with a buffer
-    char* api_key = getenv("API_KEY"); 
+    // TODO: Do it safely with a buffer
+    char* api_key = getenv("API_KEY");
     if (api_key == NULL) {
         failure_reason = "Please provide API_KEY";
         goto exit;
     }
 
-    // TODO: Do it safely with a buffer
-    const char* city_name = argv[1];
+    // TODO: Abstract param bufferisation
+    uint32_t param_size = strnlen(argv[1], PARAM_BUFFER_SIZE);
+    char* city_name = malloc(param_size);
+    strncpy(city_name, argv[1], param_size);
 
     // Loader
     loader_thread_id = malloc(sizeof(pthread_t));
@@ -298,16 +318,19 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
-    uint16_t param_size = sizeof(char) * 12 + 1;
-    lat_param = malloc(param_size);
-    lon_param = malloc(param_size);
-
-    snprintf(lat_param, param_size, "lat=%.2f", geodata->lat);
-    snprintf(lon_param, param_size, "lon=%.2f", geodata->lon);
-
     curl_url_set(pollution_url, CURLUPART_URL, POLLUTION_URL, 0);
-    curl_url_set(pollution_url, CURLUPART_QUERY, lat_param, 0);
-    curl_url_set(pollution_url, CURLUPART_QUERY, lon_param, CURLU_APPENDQUERY);
+    curl_url_set(
+        pollution_url, 
+        CURLUPART_QUERY, 
+        make_query_param("lat", &geodata->lat, QUERY_PARAM_DOUBLE),
+        0
+    );
+    curl_url_set(
+        pollution_url,
+        CURLUPART_QUERY,
+        make_query_param("lon", &geodata->lon, QUERY_PARAM_DOUBLE),
+        CURLU_APPENDQUERY
+    );
 
     pollution_response = make_request(curl, pollution_url, api_key);
     if (pollution_response == NULL) goto no_pollution_data;
@@ -360,20 +383,16 @@ main(int argc, char const **argv, char const **env) {
         fflush(stdout);
 
         if (loader_thread_id != NULL) {
-            void* state;
-            pthread_join(*loader_thread_id, &state);
-            if (state != PTHREAD_CANCELED) {
-                pthread_cancel(*loader_thread_id);
-                printf(ERASE_LINE_ABOVE);
-                fflush(stdout);
-            }
+            pthread_cancel(*loader_thread_id);
+            printf(ERASE_LINE_ABOVE);
+            fflush(stdout);
         }
 
         curl_easy_cleanup(curl);
         curl_global_cleanup();
 
         if (failure_reason) {
-            fprintf(stderr, "\n%s%s%s\n\n", ANSI_COLOR_RED, failure_reason, ANSI_COLOR_RESET);
+            fprintf(stderr, "%s%s%s\n\n", ANSI_COLOR_RED, failure_reason, ANSI_COLOR_RESET);
             exit(1);
         }
 
