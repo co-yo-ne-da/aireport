@@ -173,17 +173,20 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
     );
 
     json_t* target = NULL;
-    for (uint8_t i = retry_attempts; i > 0; i--) {
+    for (uint8_t i = 0; i <= retry_attempts; i++) {
+        // 1, 2, 4 seconds
+        if (i) sleep(1 << (i - 1));
+
         geocoding_response = make_request(curl, geocoding_url);
-        if (geocoding_response == NULL) goto fail;
+        if (geocoding_response == NULL) continue;
 
         coords_root = json_loads(geocoding_response->data, 0, &error);
-        if (coords_root == NULL) goto fail;
+        if (coords_root == NULL) continue;
 
         target = json_array_get(coords_root, 0);
-        if (target != NULL) break;
+        if (target == NULL) continue;
 
-        sleep(1);
+        break;
     }
 
     if (target == NULL) goto fail;
