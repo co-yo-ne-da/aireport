@@ -51,12 +51,13 @@ typedef struct {
 typedef struct {
     double co;
     double no;
-    double no3;
+    double no2;
     double o3;
     double so2;
     double nh3;
     double pm2_5;
     double pm10;
+    uint8_t aqi;
 } pollutants_t;
 
 
@@ -153,6 +154,74 @@ make_request(CURL* curl, CURLU* url) {
 }
 
 
+static pollutants_t*
+fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
+    if (geodata == NULL) return NULL;
+
+    json_error_t error;
+    pollutants_t* report = NULL;
+    response_t* pollution_response = NULL;
+    json_t* report_root = NULL;
+
+    CURLU* pollution_url = curl_url();
+    curl_url_set(pollution_url, CURLUPART_URL, POLLUTION_URL, 0);
+    curl_url_set(
+        pollution_url, 
+        CURLUPART_QUERY, 
+        make_query_param("lat", &geodata->lat, QUERY_PARAM_DOUBLE),
+        0
+    );
+    curl_url_set(
+        pollution_url,
+        CURLUPART_QUERY,
+        make_query_param("lon", &geodata->lon, QUERY_PARAM_DOUBLE),
+        CURLU_APPENDQUERY
+    );
+
+    curl_url_set(
+        pollution_url,
+        CURLUPART_QUERY, 
+        make_query_param("appid", api_key, QUERY_PARAM_STRING),
+        CURLU_APPENDQUERY
+    );
+
+    pollution_response = make_request(curl, pollution_url);
+    if (pollution_response == NULL) goto fail;
+
+    report_root = json_loads(pollution_response->data, 0, &error);
+    if (report_root == NULL) goto fail;
+
+    json_t* list = json_object_get(report_root, "list");
+    json_t* obj  = json_array_get(list, 0);
+    json_t* main = json_object_get(obj, "main");
+    json_t* aqi  = json_object_get(main, "aqi");
+
+    json_t* components = json_object_get(obj, "components");
+
+    uint8_t aqi_value = json_integer_value(aqi);
+    if (aqi_value < 1 || aqi_value > 5) goto fail;
+
+    report = malloc(sizeof(pollutants_t));
+    report->co = json_real_value(json_object_get(components, "co"));
+    report->no = json_real_value(json_object_get(components, "no"));
+    report->no2 = json_real_value(json_object_get(components, "no2"));
+    report->o3 = json_real_value(json_object_get(components, "o3"));
+    report->so2 = json_real_value(json_object_get(components, "so2"));
+    report->nh3 = json_real_value(json_object_get(components, "nh3"));
+    report->pm2_5 = json_real_value(json_object_get(components, "pm2_5"));
+    report->pm10 = json_real_value(json_object_get(components, "pm10"));
+    report->aqi = aqi_value;
+
+    return report;
+
+    fail:
+        if (report) free(report);
+        if (pollution_response) free(pollution_response);
+        if (report_root) json_decref(report_root);
+        return NULL;
+}
+
+
 static geodata_t*
 fetch_geodata(CURL* curl, char* city_name, char* api_key) {
     uint8_t retry_attempts = 3;
@@ -226,9 +295,7 @@ print_color_tag(char* color) {
 }
 
 static void
-print_pollutant_row(char* label, json_t* pollutant_volume, uint8_t ranges_table_index) {
-    double value = json_real_value(pollutant_volume);
-
+print_pollutant_row(char* label, double value, uint8_t ranges_table_index) {
     uint8_t i = 0;
     uint32_t cmp_value = (uint32_t) value;
     while (i < 4 && RANGES_TABLE[ranges_table_index][i] < cmp_value) i++;
@@ -290,11 +357,6 @@ int
 main(int argc, char const **argv, char const **env) {
     /* -- Initialisation -- */
     char* failure_reason = NULL;
-    json_error_t error;
-
-    CURLU* pollution_url = curl_url();
-    response_t* pollution_response = NULL;
-    json_t* report_root = NULL;
 
     pthread_t* loader_thread_id = NULL;
 
@@ -339,44 +401,9 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
-    /* -- Fetching pollution data -- */
-    curl_url_set(pollution_url, CURLUPART_URL, POLLUTION_URL, 0);
-    curl_url_set(
-        pollution_url, 
-        CURLUPART_QUERY, 
-        make_query_param("lat", &geodata->lat, QUERY_PARAM_DOUBLE),
-        0
-    );
-    curl_url_set(
-        pollution_url,
-        CURLUPART_QUERY,
-        make_query_param("lon", &geodata->lon, QUERY_PARAM_DOUBLE),
-        CURLU_APPENDQUERY
-    );
-
-    curl_url_set(
-        pollution_url,
-        CURLUPART_QUERY, 
-        make_query_param("appid", api_key, QUERY_PARAM_STRING),
-        CURLU_APPENDQUERY
-    );
-
-    pollution_response = make_request(curl, pollution_url);
-    if (pollution_response == NULL) goto no_pollution_data;
-
-    report_root = json_loads(pollution_response->data, 0, &error);
-    if (report_root == NULL) goto no_pollution_data;
-
-    json_t* list = json_object_get(report_root, "list");
-    json_t* obj  = json_array_get(list, 0);
-    json_t* main = json_object_get(obj, "main");
-    json_t* aqi  = json_object_get(main, "aqi");
-
-    json_t* components = json_object_get(obj, "components");
-
-    uint8_t aqi_value = json_integer_value(aqi);
-    if (aqi_value < 1 || aqi_value > 5) {
-        failure_reason = "Incorrect AQI index";
+    pollutants_t* report = fetch_pollution_report(curl, geodata, api_key);
+    if (report == NULL) {
+        failure_reason = "Cannot fetch pollution report, please try again.";
         goto exit;
     }
 
@@ -388,25 +415,21 @@ main(int argc, char const **argv, char const **env) {
 
     /* -- Printing the report -- */
     printf("Air quality in %s ", geodata->city_name);
-    print_color_tag(COLORS_TABLE[aqi_value - 1]);
-    printf("\n\n\tAQI %hhu (%s) \n\n", aqi_value, LABELS_TABLE[aqi_value - 1]);
+    print_color_tag(COLORS_TABLE[report->aqi - 1]);
+    printf("\n\n\tAQI %hhu (%s) \n\n", report->aqi, LABELS_TABLE[report->aqi - 1]);
 
-    print_pollutant_row("Carbone monoxide (CO)  ",  json_object_get(components, "co"),     0);
-    print_pollutant_row("Nitrogen monoxide (NO) ",  json_object_get(components, "no"),     1);
-    print_pollutant_row("Nitrogen dioxide (NO₂) ",  json_object_get(components, "no2"),    2);
-    print_pollutant_row("Ozone (O₃)             ",  json_object_get(components, "o3"),     3);
-    print_pollutant_row("Sulphur dioxide (SO₂)  ",  json_object_get(components, "so2"),    4);
-    print_pollutant_row("Ammonia (NH₃)          ",  json_object_get(components, "nh3"),    5);
-    print_pollutant_row("Particular matter 2.5µm",  json_object_get(components, "pm2_5"),  6);
-    print_pollutant_row("Particular matter 10µm ",  json_object_get(components, "pm10"),   7);
+    print_pollutant_row("Carbone monoxide (CO)  ",  report->co,     0);
+    print_pollutant_row("Nitrogen monoxide (NO) ",  report->no,     1);
+    print_pollutant_row("Nitrogen dioxide (NO₂) ",  report->no2,    2);
+    print_pollutant_row("Ozone (O₃)             ",  report->o3,     3);
+    print_pollutant_row("Sulphur dioxide (SO₂)  ",  report->so2,    4);
+    print_pollutant_row("Ammonia (NH₃)          ",  report->nh3,    5);
+    print_pollutant_row("Particular matter 2.5µm",  report->pm2_5,  6);
+    print_pollutant_row("Particular matter 10µm ",  report->pm10,   7);
 
     print_legend();
 
     goto exit;
-
-    no_pollution_data:
-        failure_reason = "Cannot fetch pollution data, please try again.";
-        goto exit;
 
     exit:
         free(api_key);
