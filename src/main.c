@@ -5,6 +5,7 @@
 
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 
 #include <wchar.h>
 #include <locale.h>
@@ -38,8 +39,8 @@
 
 
 typedef struct {
-    char* data;
     size_t len;
+    char* data;
 } response_t;
 
 typedef struct {
@@ -202,15 +203,15 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
     if (aqi_value < 1 || aqi_value > 5) goto fail;
 
     report = malloc(sizeof(pollutants_t));
-    report->co = json_real_value(json_object_get(components, "co"));
-    report->no = json_real_value(json_object_get(components, "no"));
-    report->no2 = json_real_value(json_object_get(components, "no2"));
-    report->o3 = json_real_value(json_object_get(components, "o3"));
-    report->so2 = json_real_value(json_object_get(components, "so2"));
-    report->nh3 = json_real_value(json_object_get(components, "nh3"));
+    report->co    = json_real_value(json_object_get(components, "co"));
+    report->no    = json_real_value(json_object_get(components, "no"));
+    report->no2   = json_real_value(json_object_get(components, "no2"));
+    report->o3    = json_real_value(json_object_get(components, "o3"));
+    report->so2   = json_real_value(json_object_get(components, "so2"));
+    report->nh3   = json_real_value(json_object_get(components, "nh3"));
     report->pm2_5 = json_real_value(json_object_get(components, "pm2_5"));
-    report->pm10 = json_real_value(json_object_get(components, "pm10"));
-    report->aqi = aqi_value;
+    report->pm10  = json_real_value(json_object_get(components, "pm10"));
+    report->aqi   = aqi_value;
 
     return report;
 
@@ -271,7 +272,6 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
     geodata->lat = json_real_value(json_object_get(target, "lat"));
     geodata->lon = json_real_value(json_object_get(target, "lon"));
 
-    // Implement retry
     if (geodata->lat == 0 || geodata->lon == 0) goto fail;
 
     free(geocoding_response);
@@ -319,7 +319,7 @@ print_legend() {
 
 
 static inline void
-print_loader_fragment(size_t code, char* label, struct timespec* ts) {
+print_loader_fragment(size_t code, const char* label, struct timespec* ts) {
     wprintf(L"%s[%lc]%s", ANSI_COLOR_MAGENTA, code, ANSI_COLOR_RESET);
     fflush(stdout);
     nanosleep(ts, NULL);
@@ -329,9 +329,10 @@ print_loader_fragment(size_t code, char* label, struct timespec* ts) {
 
 
 static void*
-show_loader(void* label) {
-    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-
+show_loader(void* is_active) {
+    flockfile(stdout);
+    uint8_t* active = (uint8_t*)is_active;
+    const char* label = "Loading air quality report..";
     uint32_t ms = 150;
 
     struct timespec ts;
@@ -339,28 +340,42 @@ show_loader(void* label) {
     ts.tv_nsec = (ms % 1000) * 1000000;
     
     printf(HIDE_CURSOR);
-    printf("\n\r%s ", (char*)label);
+    printf("\n\r%s ", label);
     fflush(stdout);
     
     while (1) {
-        print_loader_fragment(0x25E2, (char*)label, &ts);
-        print_loader_fragment(0x25E3, (char*)label, &ts);
-        print_loader_fragment(0x25E4, (char*)label, &ts);
-        print_loader_fragment(0x25E5, (char*)label, &ts);
+        if (! *active) break;
+        print_loader_fragment(0x25E2, label, &ts);
+        print_loader_fragment(0x25E3, label, &ts);
+        print_loader_fragment(0x25E4, label, &ts);
+        print_loader_fragment(0x25E5, label, &ts);
     }
 
+    printf(ERASE_LINE_ABOVE);
     printf(ENABLE_CURSOR);
     fflush(stdout);
+
+    funlockfile(stdout);
+    pthread_exit(NULL);
+    return NULL;
+}
+
+void
+signal_handler() {
+    fprintf(stderr, "HALP");
 }
 
 int
 main(int argc, char const **argv, char const **env) {
     /* -- Initialisation -- */
     char* failure_reason = NULL;
+    uint8_t loader_active = 0;
 
     pthread_t* loader_thread_id = NULL;
 
     setlocale(LC_CTYPE, "");
+
+    signal(SIGINT, signal_handler);
 
     char* api_key_env = getenv("API_KEY");
     size_t api_key_len = (strnlen(api_key_env, PARAM_BUFFER_SIZE) + 1) * sizeof(char);
@@ -391,8 +406,9 @@ main(int argc, char const **argv, char const **env) {
     strncpy(city_name, argv[1], param_size);
 
     /* -- Starting loader -- */
+    loader_active = 1;
     loader_thread_id = malloc(sizeof(pthread_t));
-    pthread_create(loader_thread_id, NULL, &show_loader, "Loading data");
+    pthread_create(loader_thread_id, NULL, &show_loader, &loader_active);
 
     /* -- Fetching geodata (correct city name, lat and lon) -- */
     geodata_t* geodata = fetch_geodata(curl, city_name, api_key);
@@ -408,10 +424,7 @@ main(int argc, char const **argv, char const **env) {
     }
 
     /* -- Removing loader -- */
-    pthread_cancel(*loader_thread_id);
-    printf(ERASE_LINE_ABOVE);
-    printf(ENABLE_CURSOR);
-    fflush(stdout);
+    loader_active = 0;
 
     /* -- Printing the report -- */
     printf("Air quality in %s ", geodata->city_name);
@@ -437,6 +450,7 @@ main(int argc, char const **argv, char const **env) {
         printf(ENABLE_CURSOR);
         fflush(stdout);
 
+        if (loader_active) loader_active = 0;
         if (loader_thread_id != NULL) {
             pthread_cancel(*loader_thread_id);
             printf(ERASE_LINE_ABOVE);
