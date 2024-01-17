@@ -37,6 +37,8 @@
 #define QUERY_PARAM_STRING 1 << 1
 #define QUERY_PARAM_DOUBLE 2 << 1
 
+#define POLLUTANTS_COUNT 8
+
 
 typedef struct {
     size_t len;
@@ -46,20 +48,45 @@ typedef struct {
 typedef struct {
     double lat;
     double lon;
-    const char* city_name;
+    char* city_name;
 } geodata_t;
 
+
 typedef struct {
-    double co;
-    double no;
-    double no2;
-    double o3;
-    double so2;
-    double nh3;
-    double pm2_5;
-    double pm10;
+    double value;
+    uint32_t meta; // Severity and trend [ | severity 3 bits | up / down 1 bit ]
+} pollutant_value_t;
+
+typedef struct {
+    double* components;
     uint8_t aqi;
 } pollutants_t;
+
+static char* POLLUTANT_REPORT_COMPONENTS[POLLUTANTS_COUNT] = {
+    "co", "no", "no2", "o3", "so2", "nh3", "pm2_5", "pm10"
+};
+
+static char* POLLUTANT_LABELS_TABLE[POLLUTANTS_COUNT] = {
+    "Carbone monoxide (CO)  ",
+    "Nitrogen monoxide (NO) ", 
+    "Nitrogen dioxide (NO₂) ", 
+    "Ozone (O₃)             ", 
+    "Sulphur dioxide (SO₂)  ", 
+    "Ammonia (NH₃)          ", 
+    "Particular matter 2.5µm", 
+    "Particular matter 10µm "
+};
+
+static uint32_t RANGES_TABLE[POLLUTANTS_COUNT][4] = {
+    { 4400, 9400, 12400, 15400 },  // [0] CO
+    { 20,   40,   60,    80    },  // [1] NO
+    { 40,   70,   150,   200   },  // [2] NO₂
+    { 60,   100,  140,   180   },  // [3] O₃
+    { 20,   80,   250,   350   },  // [4] SO₂
+    { 40,   80,   120,   160   },  // [5] NH₃
+    { 10,   25,   50,    75    },  // [6] PM 2.5
+    { 20,   50,   100,   200   }   // [7] PM 10
+};
 
 
 static char* COLORS_TABLE[5] = {
@@ -76,17 +103,6 @@ static char* LABELS_TABLE[5] = {
     "Moderate",
     "Poor",
     "Very Poor"
-};
-
-static uint32_t RANGES_TABLE[8][4] = {
-    { 4400, 9400, 12400, 15400 },  // [0] CO
-    { 20,   40,   60,    80    },  // [1] NO
-    { 40,   70,   150,   200   },  // [2] NO₂
-    { 60,   100,  140,   180   },  // [3] O₃
-    { 20,   80,   250,   350   },  // [4] SO₂
-    { 40,   80,   120,   160   },  // [5] NH₃
-    { 10,   25,   50,    75    },  // [6] PM 2.5
-    { 20,   50,   100,   200   }   // [7] PM 10
 };
 
 
@@ -145,7 +161,7 @@ make_request(CURL* curl, CURLU* url) {
         free(response);
         fprintf(
             stderr,
-            "The remote host responded with the error status code %s (%d) %s \n",
+            "Open Weather Map responded with the error status code %s (%d) %s \n",
             ANSI_COLOR_YELLOW, res_code, ANSI_COLOR_RESET
         );
         return NULL;
@@ -203,15 +219,15 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
     if (aqi_value < 1 || aqi_value > 5) goto fail;
 
     report = malloc(sizeof(pollutants_t));
-    report->co    = json_real_value(json_object_get(components, "co"));
-    report->no    = json_real_value(json_object_get(components, "no"));
-    report->no2   = json_real_value(json_object_get(components, "no2"));
-    report->o3    = json_real_value(json_object_get(components, "o3"));
-    report->so2   = json_real_value(json_object_get(components, "so2"));
-    report->nh3   = json_real_value(json_object_get(components, "nh3"));
-    report->pm2_5 = json_real_value(json_object_get(components, "pm2_5"));
-    report->pm10  = json_real_value(json_object_get(components, "pm10"));
+    report->components = malloc(sizeof(double) * POLLUTANTS_COUNT);
     report->aqi   = aqi_value;
+
+    double* report_ptr = report->components;
+    for (uint8_t i = 0; i < POLLUTANTS_COUNT; i++, report_ptr++) {
+        *report_ptr = json_real_value(
+            json_object_get(components, POLLUTANT_REPORT_COMPONENTS[i])
+        );
+    }
 
     return report;
 
@@ -339,7 +355,6 @@ show_loader(void* is_active) {
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000;
     
-    printf(HIDE_CURSOR);
     printf("\n\r%s ", label);
     fflush(stdout);
     
@@ -352,7 +367,6 @@ show_loader(void* is_active) {
     }
 
     printf(ERASE_LINE_ABOVE);
-    printf(ENABLE_CURSOR);
     fflush(stdout);
 
     funlockfile(stdout);
@@ -360,9 +374,26 @@ show_loader(void* is_active) {
     return NULL;
 }
 
+
+static inline void
+print_report(char* city_name, pollutants_t* report) {
+    printf("Air quality in %s ", city_name);
+    print_color_tag(COLORS_TABLE[report->aqi - 1]);
+    printf("\n\n\tAQI %hhu (%s) \n\n", report->aqi, LABELS_TABLE[report->aqi - 1]);
+
+    double* report_ptr = report->components;
+    for (uint8_t i = 0; i < POLLUTANTS_COUNT; i++, report_ptr++) {
+        print_pollutant_row(POLLUTANT_LABELS_TABLE[i], *report_ptr, i);
+    }
+
+    print_legend();
+}
+
+
 void
 signal_handler() {
     fprintf(stderr, "HALP");
+    exit(1);
 }
 
 int
@@ -406,6 +437,8 @@ main(int argc, char const **argv, char const **env) {
     strncpy(city_name, argv[1], param_size);
 
     /* -- Starting loader -- */
+    /* -- Stdout is locked -- */
+    printf(HIDE_CURSOR);
     loader_active = 1;
     loader_thread_id = malloc(sizeof(pthread_t));
     pthread_create(loader_thread_id, NULL, &show_loader, &loader_active);
@@ -417,6 +450,7 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
+    /* -- Fetching pollution report -- */
     pollutants_t* report = fetch_pollution_report(curl, geodata, api_key);
     if (report == NULL) {
         failure_reason = "Cannot fetch pollution report, please try again.";
@@ -424,24 +458,13 @@ main(int argc, char const **argv, char const **env) {
     }
 
     /* -- Removing loader -- */
+    /* -- Stdout is unlocked -- */
     loader_active = 0;
+    printf(ENABLE_CURSOR);
 
-    /* -- Printing the report -- */
-    printf("Air quality in %s ", geodata->city_name);
-    print_color_tag(COLORS_TABLE[report->aqi - 1]);
-    printf("\n\n\tAQI %hhu (%s) \n\n", report->aqi, LABELS_TABLE[report->aqi - 1]);
+    print_report(geodata->city_name, report);
 
-    print_pollutant_row("Carbone monoxide (CO)  ",  report->co,     0);
-    print_pollutant_row("Nitrogen monoxide (NO) ",  report->no,     1);
-    print_pollutant_row("Nitrogen dioxide (NO₂) ",  report->no2,    2);
-    print_pollutant_row("Ozone (O₃)             ",  report->o3,     3);
-    print_pollutant_row("Sulphur dioxide (SO₂)  ",  report->so2,    4);
-    print_pollutant_row("Ammonia (NH₃)          ",  report->nh3,    5);
-    print_pollutant_row("Particular matter 2.5µm",  report->pm2_5,  6);
-    print_pollutant_row("Particular matter 10µm ",  report->pm10,   7);
-
-    print_legend();
-
+    free(geodata);
     goto exit;
 
     exit:
