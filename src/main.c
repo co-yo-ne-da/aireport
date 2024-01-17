@@ -51,10 +51,10 @@ typedef struct {
     char* city_name;
 } geodata_t;
 
-
 typedef struct {
     double value;
-    uint32_t meta; // Severity and trend [ | severity 3 bits | up / down 1 bit ]
+    // Report meta data [ Unused bits | severity (color bubble) 3 bits (0-4) | up / down 1 bit ]
+    uint32_t meta; 
 } pollutant_value_t;
 
 typedef struct {
@@ -87,7 +87,6 @@ static uint32_t RANGES_TABLE[POLLUTANTS_COUNT][4] = {
     { 10,   25,   50,    75    },  // [6] PM 2.5
     { 20,   50,   100,   200   }   // [7] PM 10
 };
-
 
 static char* COLORS_TABLE[5] = {
     ANSI_COLOR_CYAN,
@@ -140,6 +139,7 @@ make_query_param(char* key, void* value, uint8_t value_type) {
 
     return param_ptr;
 }
+
 
 static response_t*
 make_request(CURL* curl, CURLU* url) {
@@ -310,6 +310,7 @@ print_color_tag(char* color) {
     printf(ANSI_COLOR_RESET);
 }
 
+
 static void
 print_pollutant_row(char* label, double value, uint8_t ranges_table_index) {
     uint8_t i = 0;
@@ -322,6 +323,7 @@ print_pollutant_row(char* label, double value, uint8_t ranges_table_index) {
     printf(" %.2f µg/m3 \n", value);
 
 }
+
 
 static inline void
 print_legend() {
@@ -398,31 +400,35 @@ signal_handler() {
 
 int
 main(int argc, char const **argv, char const **env) {
+     setlocale(LC_CTYPE, "");
+
     /* -- Initialisation -- */
     char* failure_reason = NULL;
     uint8_t loader_active = 0;
 
+    CURL* curl = NULL;
+    char* api_key = NULL;
     pthread_t* loader_thread_id = NULL;
-
-    setlocale(LC_CTYPE, "");
 
     signal(SIGINT, signal_handler);
 
+    /* -- / initialisation -- */
+
+    if (getenv("API_KEY") == NULL) {
+        failure_reason = "Please provide API_KEY";
+        goto exit;
+    }
+
     char* api_key_env = getenv("API_KEY");
     size_t api_key_len = (strnlen(api_key_env, PARAM_BUFFER_SIZE) + 1) * sizeof(char);
-    char* api_key = malloc(api_key_len);
+    api_key = malloc(api_key_len);
     strncpy(api_key, api_key_env, api_key_len);
 
-    CURL* curl = curl_easy_init();
+    curl = curl_easy_init();
     curl_global_init(CURL_GLOBAL_ALL);
 
     if (curl == NULL) {
         failure_reason = "Failed to initialize curl.";
-        goto exit;
-    }
-
-    if (api_key == NULL) {
-        failure_reason = "Please provide API_KEY";
         goto exit;
     }
 
@@ -463,10 +469,10 @@ main(int argc, char const **argv, char const **env) {
     printf(ENABLE_CURSOR);
 
     print_report(geodata->city_name, report);
-
     free(geodata);
-    goto exit;
+    free(report);
 
+    goto exit;
     exit:
         free(api_key);
         // TODO: Handle signals gracefully
