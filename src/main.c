@@ -394,6 +394,7 @@ print_report(char* city_name, pollutants_t* report) {
 
 void
 signal_handler() {
+    // TODO: Handle signals gracefully
     fprintf(stderr, "HALP");
     exit(1);
 }
@@ -475,16 +476,15 @@ main(int argc, char const **argv, char const **env) {
     goto exit;
     exit:
         free(api_key);
-        // TODO: Handle signals gracefully
-        printf(ENABLE_CURSOR);
-        fflush(stdout);
-
         if (loader_active) loader_active = 0;
-        if (loader_thread_id != NULL) {
+/*        if (loader_thread_id != NULL) {
             pthread_cancel(*loader_thread_id);
             printf(ERASE_LINE_ABOVE);
             fflush(stdout);
-        }
+        }*/
+
+        printf(ERASE_LINE_ABOVE);
+        printf(ENABLE_CURSOR);
 
         curl_easy_cleanup(curl);
         curl_global_cleanup();
