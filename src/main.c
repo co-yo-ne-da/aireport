@@ -39,6 +39,10 @@
 
 #define POLLUTANTS_COUNT 8
 
+#define RESP_OK 0U
+#define RESP_ERR_UNAUTHENTICATED 1U
+#define RESP_ERR_BAD_REQUEST 1 << 1U
+
 
 typedef struct {
     size_t len;
@@ -141,13 +145,9 @@ make_query_param(char* key, void* value, uint8_t value_type) {
 }
 
 
-static response_t*
-make_request(CURL* curl, CURLU* url) {
+static uint8_t
+make_request(CURL* curl, CURLU* url, response_t* response) {
     uint32_t res_code;
-
-    response_t* response = malloc(sizeof(response_t));
-    response->data = malloc(BUFFER_SIZE);
-    response->len = 0;
 
     curl_easy_setopt(curl, CURLOPT_CURLU, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &write_response);
@@ -158,16 +158,16 @@ make_request(CURL* curl, CURLU* url) {
     curl_easy_reset(curl);
 
     if (res_code != 200) {
-        free(response);
+        // Return appropriate code for each status in question
         fprintf(
             stderr,
             "Open Weather Map responded with the error status code %s (%d) %s \n",
             ANSI_COLOR_YELLOW, res_code, ANSI_COLOR_RESET
         );
-        return NULL;
+        return 1;
     }
 
-    return response;
+    return 0;
 }
 
 
@@ -177,8 +177,12 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
 
     json_error_t error;
     pollutants_t* report = NULL;
-    response_t* pollution_response = NULL;
     json_t* report_root = NULL;
+
+    response_t pollution_response = {
+        .data = malloc(BUFFER_SIZE),
+        .len = 0
+    };
 
     CURLU* pollution_url = curl_url();
     curl_url_set(pollution_url, CURLUPART_URL, POLLUTION_URL, 0);
@@ -202,10 +206,10 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
         CURLU_APPENDQUERY
     );
 
-    pollution_response = make_request(curl, pollution_url);
-    if (pollution_response == NULL) goto fail;
+    uint8_t status = make_request(curl, pollution_url, &pollution_response);
+    if (status != 0) goto fail;
 
-    report_root = json_loads(pollution_response->data, 0, &error);
+    report_root = json_loads(pollution_response.data, 0, &error);
     if (report_root == NULL) goto fail;
 
     json_t* list = json_object_get(report_root, "list");
@@ -233,7 +237,6 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
 
     fail:
         if (report) free(report);
-        if (pollution_response) free(pollution_response);
         if (report_root) json_decref(report_root);
         return NULL;
 }
@@ -245,7 +248,11 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
     json_error_t error;
     geodata_t* geodata = NULL;
     json_t* coords_root = NULL;
-    response_t* geocoding_response  = NULL;
+
+    response_t geocoding_response = {
+        .data = malloc(BUFFER_SIZE),
+        .len = 0
+    };;
 
     CURLU* geocoding_url = curl_url();
     curl_url_set(geocoding_url, CURLUPART_URL, GEOCODING_URL, 0);
@@ -263,10 +270,10 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
         // 1, 2, 4 seconds
         if (i) sleep(1 << (i - 1));
 
-        geocoding_response = make_request(curl, geocoding_url);
-        if (geocoding_response == NULL) continue;
+        uint8_t status = make_request(curl, geocoding_url, &geocoding_response);
+        if (status != 0) continue;
 
-        coords_root = json_loads(geocoding_response->data, 0, &error);
+        coords_root = json_loads(geocoding_response.data, 0, &error);
         if (coords_root == NULL) continue;
 
         target = json_array_get(coords_root, 0);
@@ -290,14 +297,12 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
 
     if (geodata->lat == 0 || geodata->lon == 0) goto fail;
 
-    free(geocoding_response);
     json_decref(coords_root);
 
     return geodata;
 
     fail:
         if (geodata) free(geodata);
-        if (geocoding_response) free(geocoding_response);
         if (coords_root) json_decref(coords_root);
         return NULL;
 }
@@ -395,7 +400,7 @@ print_report(char* city_name, pollutants_t* report) {
 void
 signal_handler() {
     // TODO: Handle signals gracefully
-    fprintf(stderr, "HALP");
+    fprintf(stderr, "HALP\n");
     exit(1);
 }
 
@@ -408,7 +413,7 @@ main(int argc, char const **argv, char const **env) {
     uint8_t loader_active = 0;
 
     CURL* curl = NULL;
-    char* api_key = NULL;
+    // char* api_key = NULL;
     pthread_t* loader_thread_id = NULL;
 
     signal(SIGINT, signal_handler);
@@ -420,10 +425,7 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
-    char* api_key_env = getenv("API_KEY");
-    size_t api_key_len = (strnlen(api_key_env, PARAM_BUFFER_SIZE) + 1) * sizeof(char);
-    api_key = malloc(api_key_len);
-    strncpy(api_key, api_key_env, api_key_len);
+    char* api_key = strndup(getenv("API_KEY"), PARAM_BUFFER_SIZE);
 
     curl = curl_easy_init();
     curl_global_init(CURL_GLOBAL_ALL);
@@ -438,10 +440,7 @@ main(int argc, char const **argv, char const **env) {
         goto exit;
     }
 
-    // TODO: Abstract param bufferisation
-    uint32_t param_size = strnlen(argv[1], PARAM_BUFFER_SIZE);
-    char* city_name = malloc(param_size);
-    strncpy(city_name, argv[1], param_size);
+    char* city_name = strndup(argv[1], PARAM_BUFFER_SIZE);
 
     /* -- Starting loader -- */
     /* -- Stdout is locked -- */
@@ -475,22 +474,17 @@ main(int argc, char const **argv, char const **env) {
 
     goto exit;
     exit:
-        free(api_key);
         if (loader_active) loader_active = 0;
-/*        if (loader_thread_id != NULL) {
-            pthread_cancel(*loader_thread_id);
-            printf(ERASE_LINE_ABOVE);
-            fflush(stdout);
-        }*/
-
         printf(ERASE_LINE_ABOVE);
         printf(ENABLE_CURSOR);
 
+        
         curl_easy_cleanup(curl);
         curl_global_cleanup();
 
         if (failure_reason) {
             fprintf(stderr, "%s%s%s\n\n", ANSI_COLOR_RED, failure_reason, ANSI_COLOR_RESET);
+            fflush(stderr);
             exit(1);
         }
 
