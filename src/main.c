@@ -39,7 +39,7 @@
 
 #define POLLUTANTS_COUNT 8
 
-#define REQ_RETRY_ATTEMPTS 5U
+#define REQ_RETRY_ATTEMPTS 4U
 
 #define RESP_OK 0U
 #define RESP_ERR_UNAUTHENTICATED 1U
@@ -50,6 +50,11 @@ typedef struct {
     size_t len;
     char* data;
 } response_t;
+
+typedef struct {
+    uint32_t res_code;
+    char* message;
+} response_error_t;
 
 typedef struct {
     double lat;
@@ -159,22 +164,12 @@ make_request(CURL* curl, CURLU* url, response_t* response) {
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &res_code);
     curl_easy_reset(curl);
 
-    if (res_code != 200) {
-        // Return appropriate code for each status in question
-        fprintf(
-            stderr,
-            "Open Weather Map responded with the error status code %s (%d) %s \n",
-            ANSI_COLOR_YELLOW, res_code, ANSI_COLOR_RESET
-        );
-        return 1;
-    }
-
-    return 0;
+    return res_code == 200 ? 0 : 1;
 }
 
 
 static pollutants_t*
-fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
+fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key, response_error_t* response_error) {
     if (geodata == NULL) return NULL;
 
     json_error_t error;
@@ -209,10 +204,18 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
     );
 
     uint8_t status = make_request(curl, pollution_url, &pollution_response);
-    if (status != 0) goto fail;
+    if (status != 0) {
+        json_t* error_root = json_loads(pollution_response.data, 0, &error);
+        json_t* message = json_object_get(error_root, "message");
+        response_error->message = message ? (char*) json_string_value(message) : "Failed to fetch pollution report";
+        goto fail;
+    }
 
     report_root = json_loads(pollution_response.data, 0, &error);
-    if (report_root == NULL) goto fail;
+    if (report_root == NULL) {
+        response_error->message = "Failed to parse response";
+        goto fail;
+    }
 
     json_t* list = json_object_get(report_root, "list");
     json_t* obj  = json_array_get(list, 0);
@@ -222,7 +225,10 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
     json_t* components = json_object_get(obj, "components");
 
     uint8_t aqi_value = json_integer_value(aqi);
-    if (aqi_value < 1 || aqi_value > 5) goto fail;
+    if (aqi_value < 1 || aqi_value > 5) {
+        response_error->message = "Invalid aqi_value";
+        goto fail;
+    }
 
     report = malloc(sizeof(pollutants_t));
     report->components = malloc(sizeof(double) * POLLUTANTS_COUNT);
@@ -245,15 +251,15 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
 
 
 static geodata_t*
-fetch_geodata(CURL* curl, char* city_name, char* api_key) {
+fetch_geodata(CURL* curl, char* city_name, char* api_key, response_error_t* response_error) {
     json_error_t error;
     geodata_t* geodata = NULL;
-    json_t* coords_root = NULL;
+    json_t* response_root = NULL;
 
     response_t geocoding_response = {
         .data = malloc(BUFFER_SIZE),
         .len = 0
-    };;
+    };
 
     CURLU* geocoding_url = curl_url();
     curl_url_set(geocoding_url, CURLUPART_URL, GEOCODING_URL, 0);
@@ -273,16 +279,21 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
         uint8_t status = make_request(curl, geocoding_url, &geocoding_response);
         if (status != 0) continue;
 
-        coords_root = json_loads(geocoding_response.data, 0, &error);
-        if (coords_root == NULL) continue;
+        response_root = json_loads(geocoding_response.data, 0, &error);
+        if (response_root == NULL) continue;
 
-        target = json_array_get(coords_root, 0);
+        target = json_array_get(response_root, 0);
         if (target == NULL) continue;
 
         break;
     }
 
-    if (target == NULL) goto fail;
+    if (target == NULL) {
+        if (response_root == NULL) goto fail;
+        json_t* message = json_object_get(response_root, "message");
+        response_error->message = message ? (char*) json_string_value(message) : "Failed to fetch geodata";
+        goto fail;
+    }
 
     geodata = malloc(sizeof(geodata_t));
 
@@ -297,13 +308,13 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
 
     if (geodata->lat == 0 || geodata->lon == 0) goto fail;
 
-    json_decref(coords_root);
+    json_decref(response_root);
 
     return geodata;
 
     fail:
         if (geodata) free(geodata);
-        if (coords_root) json_decref(coords_root);
+        if (response_root) json_decref(response_root);
         return NULL;
 }
 
@@ -405,8 +416,12 @@ main(int argc, char const **argv, char const **env) {
     uint8_t loader_active = 0;
 
     CURL* curl = NULL;
-    // char* api_key = NULL;
     pthread_t* loader_thread_id = NULL;
+
+    response_error_t response_error = {
+        .res_code = 0,
+        .message = NULL
+    };
 
     /* -- / initialisation -- */
 
@@ -440,16 +455,16 @@ main(int argc, char const **argv, char const **env) {
     pthread_create(loader_thread_id, NULL, &show_loader, &loader_active);
 
     /* -- Fetching geodata (correct city name, lat and lon) -- */
-    geodata_t* geodata = fetch_geodata(curl, city_name, api_key);
+    geodata_t* geodata = fetch_geodata(curl, city_name, api_key, &response_error);
     if (geodata == NULL) {
-        failure_reason = "Cannot fetch geodata, please try again.";
+        failure_reason = response_error.message;
         goto exit;
     }
 
     /* -- Fetching pollution report -- */
-    pollutants_t* report = fetch_pollution_report(curl, geodata, api_key);
+    pollutants_t* report = fetch_pollution_report(curl, geodata, api_key, &response_error);
     if (report == NULL) {
-        failure_reason = "Cannot fetch pollution report, please try again.";
+        failure_reason = response_error.message;
         goto exit;
     }
 
