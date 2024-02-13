@@ -39,6 +39,8 @@
 
 #define POLLUTANTS_COUNT 8
 
+#define REQ_RETRY_ATTEMPTS 5U
+
 #define RESP_OK 0U
 #define RESP_ERR_UNAUTHENTICATED 1U
 #define RESP_ERR_BAD_REQUEST 1 << 1U
@@ -224,7 +226,7 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
 
     report = malloc(sizeof(pollutants_t));
     report->components = malloc(sizeof(double) * POLLUTANTS_COUNT);
-    report->aqi   = aqi_value;
+    report->aqi        = aqi_value;
 
     double* report_ptr = report->components;
     for (uint8_t i = 0; i < POLLUTANTS_COUNT; i++, report_ptr++) {
@@ -244,7 +246,6 @@ fetch_pollution_report(CURL* curl, geodata_t* geodata, char* api_key) {
 
 static geodata_t*
 fetch_geodata(CURL* curl, char* city_name, char* api_key) {
-    uint8_t retry_attempts = 3;
     json_error_t error;
     geodata_t* geodata = NULL;
     json_t* coords_root = NULL;
@@ -266,8 +267,7 @@ fetch_geodata(CURL* curl, char* city_name, char* api_key) {
     );
 
     json_t* target = NULL;
-    for (uint8_t i = 0; i <= retry_attempts; i++) {
-        // 1, 2, 4 seconds
+    for (uint8_t i = 0; i <= REQ_RETRY_ATTEMPTS; i++) {
         if (i) sleep(1 << (i - 1));
 
         uint8_t status = make_request(curl, geocoding_url, &geocoding_response);
@@ -384,7 +384,7 @@ show_loader(void* is_active) {
 
 static inline void
 print_report(char* city_name, pollutants_t* report) {
-    printf("Air quality in %s ", city_name);
+    printf("\tAir quality in %s ", city_name);
     print_color_tag(COLORS_TABLE[report->aqi - 1]);
     printf("\n\n\tAQI %hhu (%s) \n\n", report->aqi, LABELS_TABLE[report->aqi - 1]);
 
@@ -394,14 +394,6 @@ print_report(char* city_name, pollutants_t* report) {
     }
 
     print_legend();
-}
-
-
-void
-signal_handler() {
-    // TODO: Handle signals gracefully
-    fprintf(stderr, "HALP\n");
-    exit(1);
 }
 
 int
@@ -415,8 +407,6 @@ main(int argc, char const **argv, char const **env) {
     CURL* curl = NULL;
     // char* api_key = NULL;
     pthread_t* loader_thread_id = NULL;
-
-    signal(SIGINT, signal_handler);
 
     /* -- / initialisation -- */
 
@@ -472,13 +462,11 @@ main(int argc, char const **argv, char const **env) {
     free(geodata);
     free(report);
 
-    goto exit;
     exit:
         if (loader_active) loader_active = 0;
         printf(ERASE_LINE_ABOVE);
         printf(ENABLE_CURSOR);
 
-        
         curl_easy_cleanup(curl);
         curl_global_cleanup();
 

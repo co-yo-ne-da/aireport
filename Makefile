@@ -2,7 +2,7 @@ CC=clang
 
 LINKS = -lcurl -ljansson -lpthread
 
-CFLAGS = -Wall -O2 --std=c99
+CFLAGS = -Wall -O1 --std=c99
 
 SRC_DIR=src
 OBJ_DIR=obj
